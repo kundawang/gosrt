@@ -35,6 +35,7 @@ func TestMarshalUnmarshal(t *testing.T) {
 		LossMaxTTL:            42,
 		MaxBW:                 42,
 		MessageAPI:            true,
+		MaxMessageSize:        42,
 		MinInputBW:            42,
 		MSS:                   42,
 		NAKReport:             false,

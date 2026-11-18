@@ -198,7 +198,8 @@ known options (similar to [srt-live-transmit](https://github.com/Haivision/srt/b
 | `lossmaxttl`         | `packets`              | Max. packet reorder tolerance. A gap is reported with a NAK only after that many more packets arrived. The tolerance adapts to the reordering on the link, as in libsrt. Default: 0 (immediate NAK). |
 | `maxbw`              | `bytes`                | Bandwidth limit. Ignored.                                               |
 | `mininputbw`         | `bytes`                | Minimum allowed estimate of `inputbw`.                                  |
-| `messageapi`         | `bool`                 | Enable SRT message mode. Must be `false`.                               |
+| `messageapi`         | `bool`                 | Enable SRT message mode. When enabled, use `Conn.ReadMessage`/`Conn.WriteMessage` to send and receive messages with preserved boundaries; `Read`/`Write` stay byte streams. |
+| `maxmessagesize`     | `bytes`                | Maximum size of a single message in message mode. Default: 16777216 (16 MiB). |
 | `mss`                | 76...                  | MTU size.                                                               |
 | `nakreport`          | `bool`                 | Enable periodic NAK reports.                                            |
 | `oheadbw`            | 10...100               | Limits bandwidth overhead. Percents. Ignored.                           |

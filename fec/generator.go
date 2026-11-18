@@ -71,6 +71,21 @@ func (g *Generator) generateRowFEC() *ControlPacket {
 
 	ctrl.PayloadRecov = make([]byte, maxLen)
 
+	// The message metadata (packet position, order flag and message number)
+	// of all packets in the row is XOR'ed, just like the payload. This allows
+	// the reconstructor to restore the metadata of the recovered packet. In
+	// stream mode all packets are single packet messages with message number
+	// 1, which is also what a recovered packet defaults to. The metadata is
+	// only added if there is something to restore, to keep the control packet
+	// small.
+	for _, p := range g.buffer {
+		ctrl.MessageMetadataRecov ^= packMessageMetadata(p.Header().PacketPositionFlag, p.Header().OrderFlag, p.Header().MessageNumber)
+
+		if p.Header().PacketPositionFlag != packet.SinglePacket || p.Header().OrderFlag || p.Header().MessageNumber != 1 {
+			ctrl.HasMessageMetadata = true
+		}
+	}
+
 	for _, p := range g.buffer {
 		ctrl.TimestampRecov ^= p.Header().Timestamp
 		// Flags: we'd XOR KK flags here

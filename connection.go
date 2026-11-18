@@ -37,6 +37,19 @@ type Conn interface {
 	// time limit; see SetDeadline and SetWriteDeadline.
 	Write(p []byte) (int, error)
 
+	// ReadMessage reads one message that the peer wrote with WriteMessage.
+	// Message boundaries are preserved. If b is too small for the message,
+	// the message is consumed and ErrMessageTooSmall is returned. It requires
+	// Config.MessageAPI to be enabled, otherwise ErrMessageAPIDisabled is
+	// returned. It must not be used concurrently with Read or ReadPacket.
+	ReadMessage(b []byte) (int, error)
+
+	// WriteMessage writes one message to the connection. Messages larger than
+	// a single packet payload are fragmented and reassembled at the peer. It
+	// requires Config.MessageAPI to be enabled, otherwise ErrMessageAPIDisabled
+	// is returned. Zero-length messages return ErrEmptyMessage.
+	WriteMessage(b []byte) (int, error)
+
 	// WritePacket writes a packet to the write queue. Packets on the write queue
 	// will be sent to the peer of the connection. Only data packets will be sent.
 	WritePacket(p packet.Packet) error
@@ -211,10 +224,18 @@ type srtConn struct {
 	readQueue  chan packet.Packet
 	readBuffer bytes.Buffer
 
-	deadlineLock   sync.Mutex
-	readDeadline   time.Time
-	writeDeadline  time.Time
-	readDeadlineCh chan struct{}
+	// Message mode state. Only used if config.MessageAPI is set.
+	readMessageLock   sync.Mutex
+	writeMessageLock  sync.Mutex
+	messageAsm        messageAssembler
+	messageResults    []messageResult
+	nextMessageNumber uint32
+
+	deadlineLock    sync.Mutex
+	readDeadline    time.Time
+	writeDeadline   time.Time
+	readDeadlineCh  chan struct{}
+	writeDeadlineCh chan struct{}
 
 	onSend     func(p packet.Packet)
 	onShutdown func(*srtConn)
@@ -323,6 +344,26 @@ func newSRTConn(config srtConnConfig) *srtConn {
 
 	c.readQueue = make(chan packet.Packet, 1024)
 	c.readDeadlineCh = make(chan struct{})
+	c.writeDeadlineCh = make(chan struct{})
+
+	if c.config.MessageAPI && len(c.config.PacketFilter) > 0 {
+		// A FEC control packet carries the payload of the largest data packet
+		// in its row plus the FEC header and, in message mode, the message
+		// metadata. Reserve room for both so that the control packets fit into
+		// the configured payload size as well.
+		size := int(c.config.PayloadSize) - fec.ExtraHeaderSize - fec.MessageMetadataSize
+		if c.version == 4 {
+			// Keep the payload a multiple of a MPEG-TS packet.
+			size = size / 188 * 188
+		}
+
+		if size > 0 {
+			c.writeData = c.writeData[:size]
+		}
+	}
+
+	c.messageAsm = newMessageAssembler(c.maxMessageSize())
+	c.nextMessageNumber = 1
 
 	if c.config.DriftTracer {
 		c.driftTracer = newDriftTracer()
@@ -361,6 +402,7 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		InputBW:               c.config.InputBW,
 		MinInputBW:            c.config.MinInputBW,
 		OverheadBW:            c.config.OverheadBW,
+		MessageMode:           c.config.MessageAPI,
 		OnDeliver:             c.pop,
 	})
 
@@ -1728,6 +1770,8 @@ func (c *srtConn) SetWriteDeadline(t time.Time) error {
 	defer c.deadlineLock.Unlock()
 
 	c.writeDeadline = t
+	close(c.writeDeadlineCh)
+	c.writeDeadlineCh = make(chan struct{})
 
 	return nil
 }
@@ -1737,6 +1781,13 @@ func (c *srtConn) readDeadlineState() (time.Time, <-chan struct{}) {
 	defer c.deadlineLock.Unlock()
 
 	return c.readDeadline, c.readDeadlineCh
+}
+
+func (c *srtConn) writeDeadlineState() (time.Time, <-chan struct{}) {
+	c.deadlineLock.Lock()
+	defer c.deadlineLock.Unlock()
+
+	return c.writeDeadline, c.writeDeadlineCh
 }
 
 func (c *srtConn) writeDeadlineExpired() bool {

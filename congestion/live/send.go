@@ -18,7 +18,10 @@ type SendConfig struct {
 	InputBW               int64
 	MinInputBW            int64
 	OverheadBW            int64
-	OnDeliver             func(p packet.Packet)
+	// MessageMode preserves the message position and message number that were
+	// set by the application. In stream mode every packet is a single message.
+	MessageMode bool
+	OnDeliver   func(p packet.Packet)
 }
 
 // sender implements the Sender interface
@@ -35,6 +38,8 @@ type sender struct {
 	maxBW          float64 // bytes/s
 	inputBW        float64 // bytes/s
 	overheadBW     float64 // percent
+
+	messageMode bool
 
 	statistics congestion.SendStats
 
@@ -69,6 +74,7 @@ func NewSender(config SendConfig) congestion.Sender {
 		maxBW:          float64(config.MaxBW),
 		inputBW:        float64(config.InputBW),
 		overheadBW:     float64(config.OverheadBW),
+		messageMode:    config.MessageMode,
 
 		deliver: config.OnDeliver,
 	}
@@ -127,9 +133,11 @@ func (s *sender) Push(p packet.Packet) {
 
 	// Give to the packet a sequence number
 	p.Header().PacketSequenceNumber = s.nextSequenceNumber
-	p.Header().PacketPositionFlag = packet.SinglePacket
-	p.Header().OrderFlag = false
-	p.Header().MessageNumber = 1
+	if !s.messageMode {
+		p.Header().PacketPositionFlag = packet.SinglePacket
+		p.Header().OrderFlag = false
+		p.Header().MessageNumber = 1
+	}
 
 	s.nextSequenceNumber = s.nextSequenceNumber.Inc()
 
@@ -148,12 +156,15 @@ func (s *sender) Push(p packet.Packet) {
 	// documented in the specs.
 	// PktTsbpdTime is used for the timing of sending the packets. Here we
 	// can modify it because it has already been used to set the packet's
-	// timestamp.
-	probe := p.Header().PacketSequenceNumber.Val() & 0xF
-	if probe == 0 {
-		s.probeTime = p.Header().PktTsbpdTime
-	} else if probe == 1 {
-		p.Header().PktTsbpdTime = s.probeTime
+	// timestamp. In message mode all fragments share their delivery time,
+	// which must be preserved.
+	if !s.messageMode {
+		probe := p.Header().PacketSequenceNumber.Val() & 0xF
+		if probe == 0 {
+			s.probeTime = p.Header().PktTsbpdTime
+		} else if probe == 1 {
+			p.Header().PktTsbpdTime = s.probeTime
+		}
 	}
 
 	s.packetList.PushBack(p)

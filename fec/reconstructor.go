@@ -117,6 +117,8 @@ func (r *Reconstructor) tryReconstruct(snBase uint32) packet.Packet {
 		payloadRecov := make([]byte, maxLen)
 		copy(payloadRecov, ctrl.PayloadRecov)
 
+		metadataRecov := ctrl.MessageMetadataRecov
+
 		for i := uint32(0); i < uint32(r.config.Cols); i++ {
 			seq := (snBase + i) & packet.MAX_SEQUENCENUMBER
 			if seq == missingSeq {
@@ -127,6 +129,7 @@ func (r *Reconstructor) tryReconstruct(snBase uint32) packet.Packet {
 			tsRecov ^= pkt.Header().Timestamp
 			flagsRecov ^= byte(pkt.Header().KeyBaseEncryptionFlag.Val() & 0x03)
 			lengthRecov ^= uint16(pkt.Len())
+			metadataRecov ^= packMessageMetadata(pkt.Header().PacketPositionFlag, pkt.Header().OrderFlag, pkt.Header().MessageNumber)
 
 			data := pkt.Data()
 			for j := 0; j < len(data); j++ {
@@ -137,6 +140,20 @@ func (r *Reconstructor) tryReconstruct(snBase uint32) packet.Packet {
 		p.Header().Timestamp = tsRecov
 		p.Header().KeyBaseEncryptionFlag = packet.PacketEncryption(flagsRecov & 0x03)
 		p.Header().RetransmittedPacketFlag = true
+
+		// Restore the message position and number of the fragment. Without the
+		// metadata (e.g. a control packet from another implementation) the
+		// packet becomes a single packet message.
+		p.Header().PacketPositionFlag = packet.SinglePacket
+		p.Header().OrderFlag = false
+		p.Header().MessageNumber = 1
+
+		if ctrl.HasMessageMetadata {
+			position, order, messageNumber := unpackMessageMetadata(metadataRecov)
+			p.Header().PacketPositionFlag = position
+			p.Header().OrderFlag = order
+			p.Header().MessageNumber = messageNumber
+		}
 
 		if int(lengthRecov) <= len(payloadRecov) {
 			p.SetData(payloadRecov[:lengthRecov])

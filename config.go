@@ -20,6 +20,10 @@ const (
 	MAX_PASSPHRASE_SIZE = 80
 	MAX_STREAMID_SIZE   = 512
 	SRT_VERSION         = 0x010401
+
+	// DEFAULT_MAX_MESSAGE_SIZE is the default upper limit for a single message
+	// in message mode (16 MiB).
+	DEFAULT_MAX_MESSAGE_SIZE uint32 = 16 * 1024 * 1024
 )
 
 // Config is the configuration for a SRT connection
@@ -99,6 +103,13 @@ type Config struct {
 	// Enable SRT message mode.
 	// SRTO_MESSAGEAPI
 	MessageAPI bool
+
+	// Maximum size of a single message in bytes. Messages larger than this are
+	// rejected by WriteMessage and are not reassembled on the receiving side.
+	// This is a gosrt extension (SRT itself has no explicit message size limit).
+	// A value of 0 uses DEFAULT_MAX_MESSAGE_SIZE. MaxMessageSize is only used
+	// with MessageAPI enabled; Read and Write are not affected.
+	MaxMessageSize uint32
 
 	// Minimum input bandwidth
 	// This option is effective only if both SRTO_MAXBW and SRTO_INPUTBW are set to 0. It controls the minimum allowed value of the input bitrate estimate.
@@ -209,6 +220,7 @@ var defaultConfig Config = Config{
 	LossMaxTTL:            0,
 	MaxBW:                 -1,
 	MessageAPI:            false,
+	MaxMessageSize:        DEFAULT_MAX_MESSAGE_SIZE,
 	MinVersion:            SRT_VERSION,
 	MSS:                   MAX_MSS_SIZE,
 	NAKReport:             true,
@@ -382,6 +394,12 @@ func (c *Config) UnmarshalQuery(query string) error {
 	}
 
 	// minversion is ignored
+
+	if s := v.Get("maxmessagesize"); len(s) != 0 {
+		if d, err := strconv.ParseUint(s, 10, 32); err == nil {
+			c.MaxMessageSize = uint32(d)
+		}
+	}
 
 	if s := v.Get("mss"); len(s) != 0 {
 		if d, err := strconv.ParseUint(s, 10, 32); err == nil {
@@ -572,6 +590,10 @@ func (c *Config) MarshalQuery() string {
 
 	if c.MessageAPI != defaultConfig.MessageAPI {
 		q.Set("messageapi", strconv.FormatBool(c.MessageAPI))
+	}
+
+	if c.MaxMessageSize != defaultConfig.MaxMessageSize {
+		q.Set("maxmessagesize", strconv.FormatUint(uint64(c.MaxMessageSize), 10))
 	}
 
 	if c.MSS != defaultConfig.MSS {

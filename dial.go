@@ -796,6 +796,36 @@ func (dl *dialer) WritePacket(p packet.Packet) error {
 	return dl.conn.WritePacket(p)
 }
 
+func (dl *dialer) ReadMessage(b []byte) (int, error) {
+	if err := dl.checkConnection(); err != nil {
+		return 0, err
+	}
+
+	dl.connLock.RLock()
+	defer dl.connLock.RUnlock()
+
+	if dl.conn == nil {
+		return 0, fmt.Errorf("no connection")
+	}
+
+	return dl.conn.ReadMessage(b)
+}
+
+func (dl *dialer) WriteMessage(b []byte) (int, error) {
+	if err := dl.checkConnection(); err != nil {
+		return 0, err
+	}
+
+	dl.connLock.RLock()
+	defer dl.connLock.RUnlock()
+
+	if dl.conn == nil {
+		return 0, fmt.Errorf("no connection")
+	}
+
+	return dl.conn.WriteMessage(b)
+}
+
 func (dl *dialer) SetDeadline(t time.Time) error      { return dl.conn.SetDeadline(t) }
 func (dl *dialer) SetReadDeadline(t time.Time) error  { return dl.conn.SetReadDeadline(t) }
 func (dl *dialer) SetWriteDeadline(t time.Time) error { return dl.conn.SetWriteDeadline(t) }
