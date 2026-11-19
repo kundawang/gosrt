@@ -2,12 +2,30 @@ package live
 
 import (
 	"container/list"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/datarhei/gosrt/circular"
 	"github.com/datarhei/gosrt/congestion"
 	"github.com/datarhei/gosrt/packet"
+)
+
+const (
+	// DefaultOverheadBW is the bandwidth reserve for retransmissions in
+	// percent of the input bandwidth that is used if none is configured
+	// (SRTO_OHEADBW default)
+	DefaultOverheadBW = 25
+
+	// MinOverheadBW and MaxOverheadBW are the valid range for the bandwidth
+	// overhead in percent (SRTO_OHEADBW)
+	MinOverheadBW = 10
+	MaxOverheadBW = 100
+
+	// maxPacingCatchUp is the maximum time in microseconds the pacing clock
+	// may lag behind the connection time. It allows the sender to catch up
+	// after a tick was delayed, while preventing bursts after an idle phase.
+	maxPacingCatchUp = 20_000
 )
 
 // SendConfig is the configuration for the liveSend congestion control
@@ -31,10 +49,15 @@ type sender struct {
 	lock       sync.RWMutex
 
 	avgPayloadSize float64 // bytes
-	pktSndPeriod   float64 // microseconds
-	maxBW          float64 // bytes/s
-	inputBW        float64 // bytes/s
-	overheadBW     float64 // percent
+	pktSndPeriod   float64 // microseconds, 0 means sending is not paced
+	maxBW          int64   // bytes/s, < 0: no limit, 0: derived from the input bandwidth
+	inputBW        int64   // bytes/s, 0: estimated from the traffic
+	minInputBW     int64   // bytes/s, lower bound for the estimated input bandwidth
+	overheadBW     int64   // percent
+
+	// Pacing state for the bandwidth limit. nextSendTime is the connection
+	// time in microseconds from when on the next packet may leave the sender.
+	nextSendTime uint64
 
 	statistics congestion.SendStats
 
@@ -66,9 +89,10 @@ func NewSender(config SendConfig) congestion.Sender {
 		lossList:           list.New(),
 
 		avgPayloadSize: packet.MAX_PAYLOAD_SIZE, //  5.1.2. SRT's Default LiveCC Algorithm
-		maxBW:          float64(config.MaxBW),
-		inputBW:        float64(config.InputBW),
-		overheadBW:     float64(config.OverheadBW),
+		maxBW:          config.MaxBW,
+		inputBW:        config.InputBW,
+		minInputBW:     config.MinInputBW,
+		overheadBW:     config.OverheadBW,
 
 		deliver: config.OnDeliver,
 	}
@@ -77,13 +101,64 @@ func NewSender(config SendConfig) congestion.Sender {
 		s.deliver = func(p packet.Packet) {}
 	}
 
-	s.maxBW = 128 * 1024 * 1024 // 1 Gbit/s
-	s.pktSndPeriod = (s.avgPayloadSize + 16) * 1_000_000 / s.maxBW
+	if s.overheadBW <= 0 {
+		s.overheadBW = DefaultOverheadBW
+	}
+
+	s.updatePktSndPeriod()
 
 	s.rate.period = uint64(time.Second.Microseconds())
 	s.rate.last = 0
 
 	return s
+}
+
+// bandwidthLimit returns the effective send bandwidth limit in bytes/s based
+// on the configured values. 0 means unlimited.
+//
+//   - maxBW > 0: hard limit
+//   - maxBW == 0: derived from the input bandwidth (configured or estimated,
+//     at least minInputBW) plus overheadBW percent for retransmissions
+//   - maxBW < 0: unlimited
+//
+// The caller must hold the lock.
+func (s *sender) bandwidthLimit() float64 {
+	if s.maxBW < 0 {
+		return 0
+	}
+
+	if s.maxBW > 0 {
+		return float64(s.maxBW)
+	}
+
+	inputBW := float64(s.inputBW)
+	if inputBW <= 0 {
+		inputBW = s.rate.estimatedInputBW
+	}
+
+	if inputBW < float64(s.minInputBW) {
+		inputBW = float64(s.minInputBW)
+	}
+
+	if inputBW <= 0 {
+		return 0
+	}
+
+	return inputBW * (1 + float64(s.overheadBW)/100)
+}
+
+// updatePktSndPeriod recalculates the pacing interval from the current
+// bandwidth limit and the average payload size. A period of 0 means that
+// sending is not paced. The caller must hold the lock.
+func (s *sender) updatePktSndPeriod() {
+	bw := s.bandwidthLimit()
+
+	if bw <= 0 {
+		s.pktSndPeriod = 0
+		return
+	}
+
+	s.pktSndPeriod = (s.avgPayloadSize + 16) * 1_000_000 / bw
 }
 
 func (s *sender) Stats() congestion.SendStats {
@@ -115,6 +190,7 @@ func (s *sender) Flush() {
 
 	s.packetList = s.packetList.Init()
 	s.lossList = s.lossList.Init()
+	s.nextSendTime = 0
 }
 
 func (s *sender) Push(p packet.Packet) {
@@ -164,40 +240,88 @@ func (s *sender) Push(p packet.Packet) {
 func (s *sender) Tick(now uint64) {
 	// Deliver packets whose PktTsbpdTime is ripe
 	s.lock.Lock()
-	removeList := make([]*list.Element, 0, s.packetList.Len())
-	for e := s.packetList.Front(); e != nil; e = e.Next() {
-		p := e.Value.(packet.Packet)
-		if p.Header().PktTsbpdTime <= now {
-			s.statistics.Pkt++
-			s.statistics.PktUnique++
 
-			pktLen := p.Len()
+	s.updatePktSndPeriod()
 
-			s.statistics.Byte += pktLen
-			s.statistics.ByteUnique += pktLen
-
-			s.statistics.UsSndDuration += uint64(s.pktSndPeriod)
-
-			//  5.1.2. SRT's Default LiveCC Algorithm
-			s.avgPayloadSize = 0.875*s.avgPayloadSize + 0.125*float64(pktLen)
-
-			s.rate.bytesSent += pktLen
-
-			s.deliver(p)
-			removeList = append(removeList, e)
-		} else {
-			break
-		}
+	if s.pktSndPeriod > 0 && s.nextSendTime+maxPacingCatchUp < now {
+		// Bound the catch-up debt of the pacing clock. Without this, an
+		// idle phase would turn into a burst of immediately due packets
+		// once new packets arrive.
+		s.nextSendTime = now - maxPacingCatchUp
 	}
 
-	for _, e := range removeList {
+	sendList := make([]*list.Element, 0, s.packetList.Len())
+	dropList := make([]*list.Element, 0)
+	for e := s.packetList.Front(); e != nil; e = e.Next() {
+		p := e.Value.(packet.Packet)
+
+		if p.Header().PktTsbpdTime+s.dropThreshold <= now {
+			// The packet became too old before it could be sent, e.g. because
+			// the bandwidth limit holds back a backlog. Drop it instead of
+			// delivering data that the receiver would discard anyway.
+			dropList = append(dropList, e)
+			continue
+		}
+
+		if p.Header().PktTsbpdTime > now {
+			break
+		}
+
+		// Bandwidth pacing: the next packet may only leave once its time
+		// has come. A period of 0 means that sending is not paced.
+		if s.pktSndPeriod > 0 && now < s.nextSendTime {
+			break
+		}
+
+		s.statistics.Pkt++
+		s.statistics.PktUnique++
+
+		pktLen := p.Len()
+
+		s.statistics.Byte += pktLen
+		s.statistics.ByteUnique += pktLen
+
+		s.statistics.UsSndDuration += uint64(s.pktSndPeriod)
+
+		//  5.1.2. SRT's Default LiveCC Algorithm
+		s.avgPayloadSize = 0.875*s.avgPayloadSize + 0.125*float64(pktLen)
+
+		s.rate.bytesSent += pktLen
+
+		if s.pktSndPeriod > 0 {
+			s.nextSendTime += uint64(s.pktSndPeriod)
+			s.updatePktSndPeriod()
+		}
+
+		s.deliver(p)
+		sendList = append(sendList, e)
+	}
+
+	for _, e := range sendList {
 		s.lossList.PushBack(e.Value)
 		s.packetList.Remove(e)
+	}
+
+	// These packets were never sent and are not needed anymore (too late)
+	for _, e := range dropList {
+		p := e.Value.(packet.Packet)
+
+		s.statistics.PktDrop++
+		s.statistics.PktLoss++
+		s.statistics.ByteDrop += p.Len()
+		s.statistics.ByteLoss += p.Len()
+
+		s.statistics.PktBuf--
+		s.statistics.ByteBuf -= p.Len()
+
+		s.packetList.Remove(e)
+
+		p.Decommission()
 	}
 	s.lock.Unlock()
 
 	s.lock.Lock()
-	removeList = make([]*list.Element, 0, s.lossList.Len())
+	removeList := make([]*list.Element, 0, s.lossList.Len())
 	for e := s.lossList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
@@ -275,7 +399,7 @@ func (s *sender) ACK(sequenceNumber circular.Number) {
 		p.Decommission()
 	}
 
-	s.pktSndPeriod = (s.avgPayloadSize + 16) * 1000000 / s.maxBW
+	s.updatePktSndPeriod()
 }
 
 func (s *sender) NAK(sequenceNumbers []circular.Number) {
@@ -285,6 +409,8 @@ func (s *sender) NAK(sequenceNumbers []circular.Number) {
 
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
+	s.updatePktSndPeriod()
 
 	for e := s.lossList.Back(); e != nil; e = e.Prev() {
 		p := e.Value.(packet.Packet)
@@ -305,6 +431,13 @@ func (s *sender) NAK(sequenceNumbers []circular.Number) {
 				s.rate.bytesSent += p.Len()
 				s.rate.bytesRetrans += p.Len()
 
+				// Retransmissions consume from the same bandwidth budget
+				// as new packets: they are sent immediately, but delay the
+				// next regular packet accordingly.
+				if s.pktSndPeriod > 0 {
+					s.nextSendTime += uint64(s.pktSndPeriod)
+				}
+
 				p.Header().RetransmittedPacketFlag = true
 				s.deliver(p)
 			}
@@ -317,4 +450,29 @@ func (s *sender) SetDropThreshold(threshold uint64) {
 	defer s.lock.Unlock()
 
 	s.dropThreshold = threshold
+}
+
+func (s *sender) SetBandwidth(maxBW, inputBW, overheadBW int64) error {
+	if inputBW < 0 {
+		return fmt.Errorf("live: inputBW must be 0 (estimated) or positive, got %d", inputBW)
+	}
+
+	if overheadBW != 0 && (overheadBW < MinOverheadBW || overheadBW > MaxOverheadBW) {
+		return fmt.Errorf("live: overheadBW must be 0 (default) or between %d and %d, got %d", MinOverheadBW, MaxOverheadBW, overheadBW)
+	}
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.maxBW = maxBW
+	s.inputBW = inputBW
+	s.overheadBW = overheadBW
+
+	if s.overheadBW <= 0 {
+		s.overheadBW = DefaultOverheadBW
+	}
+
+	s.updatePktSndPeriod()
+
+	return nil
 }

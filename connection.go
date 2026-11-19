@@ -67,6 +67,26 @@ type Conn interface {
 	// Stats returns accumulated and instantaneous statistics of the connection.
 	Stats(s *Statistics)
 
+	// SetBandwidth updates the send bandwidth limits of an established
+	// connection, e.g. after the uplink of the network changed. The new
+	// limits apply to all packets that have not been sent yet, including
+	// queued and retransmitted packets. Sequence numbers, unacknowledged
+	// packets, and the receive state are not affected.
+	//
+	//   - maxBW: maximum send bandwidth in bytes/s. 0 derives the limit
+	//     from the input bandwidth, a negative value removes the limit
+	//     (SRTO_MAXBW).
+	//   - inputBW: expected input bandwidth in bytes/s, 0 estimates it
+	//     from the traffic (SRTO_INPUTBW).
+	//   - overheadBW: bandwidth reserve for retransmissions in percent of
+	//     the input bandwidth, 0 uses the default of 25 percent
+	//     (SRTO_OHEADBW).
+	//
+	// Passing 0 for all three values restores the fully automatic mode.
+	// An error is returned for invalid values or if the connection is
+	// already closed, and the current limits are left unchanged.
+	SetBandwidth(maxBW, inputBW, overheadBW int64) error
+
 	// Version returns the connection version, either 4 or 5. With version 4, the streamid is not available
 	Version() uint32
 }
@@ -134,6 +154,7 @@ type connStats struct {
 	pktSentShutdown   uint64
 	pktRecvShutdown   uint64
 	mbpsLinkCapacity  float64
+	maxBW             int64 // current send bandwidth limit in bytes/s, mirrors the congestion control
 }
 
 // Check if we implement the net.Conn interface
@@ -384,6 +405,7 @@ func newSRTConn(config srtConnConfig) *srtConn {
 	c.debug.expectedReadPacketSequenceNumber = c.initialPacketSequenceNumber
 
 	c.statistics.headerSize = 8 + 16 // 8 bytes UDP + 16 bytes SRT
+	c.statistics.maxBW = c.config.MaxBW
 	if strings.Count(c.localAddr.String(), ":") < 2 {
 		c.statistics.headerSize += 20 // 20 bytes IPv4 header
 	} else {
@@ -437,6 +459,28 @@ func (c *srtConn) StreamId() string {
 
 func (c *srtConn) Version() uint32 {
 	return c.version
+}
+
+// SetBandwidth updates the send bandwidth limits of the connection. See the
+// Conn interface for the semantics of the values.
+func (c *srtConn) SetBandwidth(maxBW, inputBW, overheadBW int64) error {
+	if c.ctx.Err() != nil {
+		return net.ErrClosed
+	}
+
+	if err := c.snd.SetBandwidth(maxBW, inputBW, overheadBW); err != nil {
+		return err
+	}
+
+	c.statisticsLock.Lock()
+	if maxBW < 0 {
+		c.statistics.maxBW = -1
+	} else {
+		c.statistics.maxBW = maxBW
+	}
+	c.statisticsLock.Unlock()
+
+	return nil
 }
 
 // ticker invokes the congestion control in regular intervals with

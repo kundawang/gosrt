@@ -811,6 +811,21 @@ func (dl *dialer) Stats(s *Statistics) {
 	dl.conn.Stats(s)
 }
 
+func (dl *dialer) SetBandwidth(maxBW, inputBW, overheadBW int64) error {
+	if err := dl.checkConnection(); err != nil {
+		return err
+	}
+
+	dl.connLock.RLock()
+	defer dl.connLock.RUnlock()
+
+	if dl.conn == nil {
+		return fmt.Errorf("no connection")
+	}
+
+	return dl.conn.SetBandwidth(maxBW, inputBW, overheadBW)
+}
+
 func (dl *dialer) log(topic string, message func() string) {
 	if dl.config.Logger == nil {
 		return

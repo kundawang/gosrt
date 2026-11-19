@@ -30,6 +30,22 @@ type Sender interface {
 
 	// SetDropThreshold sets the threshold in microseconds for when to drop too late packages from the queue.
 	SetDropThreshold(threshold uint64)
+
+	// SetBandwidth updates the bandwidth limits for sending. The new limits
+	// apply to all packets that have not been sent yet, including packets
+	// that are already queued and retransmissions. Sequence numbers, the
+	// queues, and the statistics are not reset.
+	//
+	//   - maxBW is the maximum send bandwidth in bytes/s. 0 derives the limit
+	//     from the input bandwidth, a negative value means no limit.
+	//   - inputBW is the expected input bandwidth in bytes/s. 0 means that it
+	//     gets estimated from the traffic.
+	//   - overheadBW is the bandwidth reserve for retransmissions in percent
+	//     of the input bandwidth. 0 means the default.
+	//
+	// Passing 0 for all values restores the fully automatic mode. An error is
+	// returned for invalid values and the current limits are left unchanged.
+	SetBandwidth(maxBW, inputBW, overheadBW int64) error
 }
 
 // Receiver is the receiving part of the congestion control

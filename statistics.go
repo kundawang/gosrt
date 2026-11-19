@@ -220,6 +220,10 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteRecvUndecrypt:  s.Accumulated.ByteRecvUndecrypt - previous.ByteRecvUndecrypt,
 	}
 
+	c.statisticsLock.RLock()
+	maxBW := c.statistics.maxBW
+	c.statisticsLock.RUnlock()
+
 	// Instantaneous
 	s.Instantaneous = StatisticsInstantaneous{
 		UsPktSendPeriod:       send.UsPktSndPeriod,
@@ -231,7 +235,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		MbpsLinkCapacity:      recv.MbpsEstimatedLinkCapacity,
 		ByteAvailSendBuf:      0, // unlimited
 		ByteAvailRecvBuf:      0, // unlimited
-		MbpsMaxBW:             float64(c.config.MaxBW) / 1024 / 1024,
+		MbpsMaxBW:             float64(maxBW) / 1024 / 1024,
 		ByteMSS:               uint64(c.config.MSS),
 		PktSendBuf:            send.PktBuf,
 		ByteSendBuf:           send.ByteBuf,
@@ -253,7 +257,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		s.Instantaneous.MbpsLinkCapacity = c.statistics.mbpsLinkCapacity
 	}
 
-	if c.config.MaxBW < 0 {
+	if maxBW < 0 {
 		s.Instantaneous.MbpsMaxBW = -1
 	}
 
